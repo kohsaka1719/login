@@ -1,0 +1,104 @@
+name: 'NO_PROXY: built Azure Login comparison'
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: '${{ matrix.variant }} / ${{ matrix.scenario }}'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Automation test
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        variant: [before, pr]
+        scenario: [baseline, exact, parent, unrelated]
+    env:
+      AZURE_CORE_OUTPUT: none
+      AZURE_LOGIN_PRE_CLEANUP: 'true'
+    steps:
+      - name: Isolate CLI state and clear inherited uppercase proxies
+        run: |
+          echo "CONTEXT_DIR=$RUNNER_TEMP/no-proxy-login" >> "$GITHUB_ENV"
+          echo "AZURE_CONFIG_DIR=$RUNNER_TEMP/no-proxy-azure" >> "$GITHUB_ENV"
+          for proxy_name in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY; do
+            echo "$proxy_name=" >> "$GITHUB_ENV"
+          done
+
+      - name: Checkout verification harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.x'
+
+      - name: Prepare comparison condition
+        id: condition
+        env:
+          VARIANT: ${{ matrix.variant }}
+          SCENARIO: ${{ matrix.scenario }}
+        run: python3 harness/scripts/no-proxy-login/probe.py prepare
+
+      - name: Checkout exact action source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Azure/login
+          ref: ${{ steps.condition.outputs.source_sha }}
+          path: action-under-test
+          persist-credentials: false
+
+      - name: Build action and record dependencies
+        working-directory: action-under-test
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          node ../harness/scripts/no-proxy-login/dependencies.cjs .
+
+      - name: Start temporary CONNECT proxy
+        run: |
+          python3 harness/scripts/no-proxy-login/probe.py proxy > "$CONTEXT_DIR/proxy-process.log" 2>&1 &
+          echo "$!" > "$CONTEXT_DIR/proxy.pid"
+          python3 harness/scripts/no-proxy-login/probe.py controls
+
+      - name: Login using built action
+        id: login
+        continue-on-error: true
+        uses: ./action-under-test
+        env:
+          http_proxy: ${{ steps.condition.outputs.proxy_url }}
+          https_proxy: ${{ steps.condition.outputs.proxy_url }}
+          no_proxy: ${{ steps.condition.outputs.no_proxy }}
+          all_proxy: ''
+        with:
+          client-id: ${{ secrets.SP1_CLIENT_ID }}
+          tenant-id: ${{ secrets.SP1_TENANT_ID }}
+          subscription-id: ${{ secrets.SP1_SUBSCRIPTION_ID }}
+          enable-AzPSSession: false
+
+      - name: Verify account, outcome, and proxy evidence
+        if: always() && steps.login.outcome != 'skipped'
+        env:
+          LOGIN_OUTCOME: ${{ steps.login.outcome }}
+          EXPECTED_CLIENT_ID: ${{ secrets.SP1_CLIENT_ID }}
+          EXPECTED_TENANT_ID: ${{ secrets.SP1_TENANT_ID }}
+          EXPECTED_SUBSCRIPTION_ID: ${{ secrets.SP1_SUBSCRIPTION_ID }}
+        run: python3 harness/scripts/no-proxy-login/probe.py verify
+
+      - name: Stop temporary proxy
+        if: always()
+        run: |
+          if [ -f "$CONTEXT_DIR/proxy.pid" ]; then
+            kill "$(cat "$CONTEXT_DIR/proxy.pid")" 2>/dev/null || true
+          fi
