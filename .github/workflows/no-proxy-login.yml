@@ -1,85 +1,37 @@
-name: 'NO_PROXY: built Azure Login comparison'
+name: 'NO_PROXY: released v3 vs PR'
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
+  id-token: write
 
+env:
+  AZURE_CORE_OUTPUT: none
+  AZURE_LOGIN_PRE_CLEANUP: 'true'
+  HTTP_PROXY: ''
+  HTTPS_PROXY: ''
+  NO_PROXY: ''
+  ALL_PROXY: ''
+
+# current: published v3, resolved on 2026-10-25, without rebuilding.
+# pr: PR #630 source, built in each job.
+# Azure CLI hosts are excluded in every case so only the OIDC exclusion changes.
+# For expected failures, confirm the OIDC ECONNREFUSED error in the login log.
 jobs:
-  compare:
-    name: '${{ matrix.variant }} / ${{ matrix.scenario }}'
+  current_baseline:
+    name: "current / no proxy: success"
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: Automation test
-    permissions:
-      contents: read
-      id-token: write
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        variant: [before, pr]
-        scenario: [baseline, exact, parent, unrelated]
-    env:
-      AZURE_CORE_OUTPUT: none
-      AZURE_LOGIN_PRE_CLEANUP: 'true'
     steps:
-      - name: Isolate CLI state and clear inherited uppercase proxies
-        run: |
-          echo "CONTEXT_DIR=$RUNNER_TEMP/no-proxy-login" >> "$GITHUB_ENV"
-          echo "AZURE_CONFIG_DIR=$RUNNER_TEMP/no-proxy-azure" >> "$GITHUB_ENV"
-          for proxy_name in HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY; do
-            echo "$proxy_name=" >> "$GITHUB_ENV"
-          done
-
-      - name: Checkout verification harness
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: harness
-          persist-credentials: false
-
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: '24.x'
-
-      - name: Prepare comparison condition
-        id: condition
+      - name: Login with released v3 (expect success)
+        uses: Azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906
         env:
-          VARIANT: ${{ matrix.variant }}
-          SCENARIO: ${{ matrix.scenario }}
-        run: python3 harness/scripts/no-proxy-login/probe.py prepare
-
-      - name: Checkout exact action source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: Azure/login
-          ref: ${{ steps.condition.outputs.source_sha }}
-          path: action-under-test
-          persist-credentials: false
-
-      - name: Build action and record dependencies
-        working-directory: action-under-test
-        run: |
-          npm ci --no-audit --no-fund
-          npm run build
-          node ../harness/scripts/no-proxy-login/dependencies.cjs .
-
-      - name: Start temporary CONNECT proxy
-        run: |
-          python3 harness/scripts/no-proxy-login/probe.py proxy > "$CONTEXT_DIR/proxy-process.log" 2>&1 &
-          echo "$!" > "$CONTEXT_DIR/proxy.pid"
-          python3 harness/scripts/no-proxy-login/probe.py controls
-
-      - name: Login using built action
-        id: login
-        continue-on-error: true
-        uses: ./action-under-test
-        env:
-          http_proxy: ${{ steps.condition.outputs.proxy_url }}
-          https_proxy: ${{ steps.condition.outputs.proxy_url }}
-          no_proxy: ${{ steps.condition.outputs.no_proxy }}
+          http_proxy: ''
+          https_proxy: ''
+          no_proxy: 'login.microsoftonline.com,management.azure.com'
           all_proxy: ''
         with:
           client-id: ${{ secrets.SP1_CLIENT_ID }}
@@ -87,18 +39,273 @@ jobs:
           subscription-id: ${{ secrets.SP1_SUBSCRIPTION_ID }}
           enable-AzPSSession: false
 
-      - name: Verify account, outcome, and proxy evidence
-        if: always() && steps.login.outcome != 'skipped'
+      - name: Verify login succeeded
+        run: az account show --output none
+
+  current_exact:
+    name: "current / exact hostname: success"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Automation test
+    steps:
+      - name: Read OIDC hostname
+        id: oidc
+        run: |
+          oidc_host="${ACTIONS_ID_TOKEN_REQUEST_URL#https://}"
+          oidc_host="${oidc_host%%/*}"
+          echo "hostname=$oidc_host" >> "$GITHUB_OUTPUT"
+
+      - name: Login with released v3 (expect success)
+        uses: Azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906
+        env:
+          http_proxy: 'http://127.0.0.1:9'
+          https_proxy: 'http://127.0.0.1:9'
+          no_proxy: 'login.microsoftonline.com,management.azure.com,${{ steps.oidc.outputs.hostname }}'
+          all_proxy: ''
+        with:
+          client-id: ${{ secrets.SP1_CLIENT_ID }}
+          tenant-id: ${{ secrets.SP1_TENANT_ID }}
+          subscription-id: ${{ secrets.SP1_SUBSCRIPTION_ID }}
+          enable-AzPSSession: false
+
+      - name: Verify login succeeded
+        run: az account show --output none
+
+  current_parent:
+    name: "current / parent domain: OIDC failure"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Automation test
+    steps:
+      - name: Read OIDC parent domain
+        id: oidc
+        run: |
+          oidc_host="${ACTIONS_ID_TOKEN_REQUEST_URL#https://}"
+          oidc_host="${oidc_host%%/*}"
+          echo "parent=${oidc_host#*.}" >> "$GITHUB_OUTPUT"
+
+      - name: Login with released v3 (expect OIDC failure)
+        id: login
+        continue-on-error: true
+        uses: Azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906
+        env:
+          http_proxy: 'http://127.0.0.1:9'
+          https_proxy: 'http://127.0.0.1:9'
+          no_proxy: 'login.microsoftonline.com,management.azure.com,${{ steps.oidc.outputs.parent }}'
+          all_proxy: ''
+        with:
+          client-id: ${{ secrets.SP1_CLIENT_ID }}
+          tenant-id: ${{ secrets.SP1_TENANT_ID }}
+          subscription-id: ${{ secrets.SP1_SUBSCRIPTION_ID }}
+          enable-AzPSSession: false
+
+      - name: Verify login failed as expected
         env:
           LOGIN_OUTCOME: ${{ steps.login.outcome }}
-          EXPECTED_CLIENT_ID: ${{ secrets.SP1_CLIENT_ID }}
-          EXPECTED_TENANT_ID: ${{ secrets.SP1_TENANT_ID }}
-          EXPECTED_SUBSCRIPTION_ID: ${{ secrets.SP1_SUBSCRIPTION_ID }}
-        run: python3 harness/scripts/no-proxy-login/probe.py verify
-
-      - name: Stop temporary proxy
-        if: always()
         run: |
-          if [ -f "$CONTEXT_DIR/proxy.pid" ]; then
-            kill "$(cat "$CONTEXT_DIR/proxy.pid")" 2>/dev/null || true
-          fi
+          test "$LOGIN_OUTCOME" = failure
+          echo 'Expected failure: confirm GitHub OIDC acquisition failed with ECONNREFUSED 127.0.0.1:9 in the login log.' >> "$GITHUB_STEP_SUMMARY"
+
+  current_unrelated:
+    name: "current / unrelated domain: OIDC failure"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Automation test
+    steps:
+      - name: Login with released v3 (expect OIDC failure)
+        id: login
+        continue-on-error: true
+        uses: Azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906
+        env:
+          http_proxy: 'http://127.0.0.1:9'
+          https_proxy: 'http://127.0.0.1:9'
+          no_proxy: 'login.microsoftonline.com,management.azure.com,no-proxy-repro.invalid'
+          all_proxy: ''
+        with:
+          client-id: ${{ secrets.SP1_CLIENT_ID }}
+          tenant-id: ${{ secrets.SP1_TENANT_ID }}
+          subscription-id: ${{ secrets.SP1_SUBSCRIPTION_ID }}
+          enable-AzPSSession: false
+
+      - name: Verify login failed as expected
+        env:
+          LOGIN_OUTCOME: ${{ steps.login.outcome }}
+        run: |
+          test "$LOGIN_OUTCOME" = failure
+          echo 'Expected failure: confirm GitHub OIDC acquisition failed with ECONNREFUSED 127.0.0.1:9 in the login log.' >> "$GITHUB_STEP_SUMMARY"
+
+  pr_baseline:
+    name: "PR / no proxy: success"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Automation test
+    steps:
+      - name: "Checkout PR #630"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Azure/login
+          ref: f6a8c089320d041a212e55c4dfb04f742398fbe1
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.x'
+
+      - name: Build PR action
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Login with built PR (expect success)
+        uses: ./
+        env:
+          http_proxy: ''
+          https_proxy: ''
+          no_proxy: 'login.microsoftonline.com,management.azure.com'
+          all_proxy: ''
+        with:
+          client-id: ${{ secrets.SP1_CLIENT_ID }}
+          tenant-id: ${{ secrets.SP1_TENANT_ID }}
+          subscription-id: ${{ secrets.SP1_SUBSCRIPTION_ID }}
+          enable-AzPSSession: false
+
+      - name: Verify login succeeded
+        run: az account show --output none
+
+  pr_exact:
+    name: "PR / exact hostname: success"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Automation test
+    steps:
+      - name: "Checkout PR #630"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Azure/login
+          ref: f6a8c089320d041a212e55c4dfb04f742398fbe1
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.x'
+
+      - name: Build PR action
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Read OIDC hostname
+        id: oidc
+        run: |
+          oidc_host="${ACTIONS_ID_TOKEN_REQUEST_URL#https://}"
+          oidc_host="${oidc_host%%/*}"
+          echo "hostname=$oidc_host" >> "$GITHUB_OUTPUT"
+
+      - name: Login with built PR (expect success)
+        uses: ./
+        env:
+          http_proxy: 'http://127.0.0.1:9'
+          https_proxy: 'http://127.0.0.1:9'
+          no_proxy: 'login.microsoftonline.com,management.azure.com,${{ steps.oidc.outputs.hostname }}'
+          all_proxy: ''
+        with:
+          client-id: ${{ secrets.SP1_CLIENT_ID }}
+          tenant-id: ${{ secrets.SP1_TENANT_ID }}
+          subscription-id: ${{ secrets.SP1_SUBSCRIPTION_ID }}
+          enable-AzPSSession: false
+
+      - name: Verify login succeeded
+        run: az account show --output none
+
+  pr_parent:
+    name: "PR / parent domain: success"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Automation test
+    steps:
+      - name: "Checkout PR #630"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Azure/login
+          ref: f6a8c089320d041a212e55c4dfb04f742398fbe1
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.x'
+
+      - name: Build PR action
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Read OIDC parent domain
+        id: oidc
+        run: |
+          oidc_host="${ACTIONS_ID_TOKEN_REQUEST_URL#https://}"
+          oidc_host="${oidc_host%%/*}"
+          echo "parent=${oidc_host#*.}" >> "$GITHUB_OUTPUT"
+
+      - name: Login with built PR (expect success)
+        uses: ./
+        env:
+          http_proxy: 'http://127.0.0.1:9'
+          https_proxy: 'http://127.0.0.1:9'
+          no_proxy: 'login.microsoftonline.com,management.azure.com,${{ steps.oidc.outputs.parent }}'
+          all_proxy: ''
+        with:
+          client-id: ${{ secrets.SP1_CLIENT_ID }}
+          tenant-id: ${{ secrets.SP1_TENANT_ID }}
+          subscription-id: ${{ secrets.SP1_SUBSCRIPTION_ID }}
+          enable-AzPSSession: false
+
+      - name: Verify login succeeded
+        run: az account show --output none
+
+  pr_unrelated:
+    name: "PR / unrelated domain: OIDC failure"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Automation test
+    steps:
+      - name: "Checkout PR #630"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Azure/login
+          ref: f6a8c089320d041a212e55c4dfb04f742398fbe1
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.x'
+
+      - name: Build PR action
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Login with built PR (expect OIDC failure)
+        id: login
+        continue-on-error: true
+        uses: ./
+        env:
+          http_proxy: 'http://127.0.0.1:9'
+          https_proxy: 'http://127.0.0.1:9'
+          no_proxy: 'login.microsoftonline.com,management.azure.com,no-proxy-repro.invalid'
+          all_proxy: ''
+        with:
+          client-id: ${{ secrets.SP1_CLIENT_ID }}
+          tenant-id: ${{ secrets.SP1_TENANT_ID }}
+          subscription-id: ${{ secrets.SP1_SUBSCRIPTION_ID }}
+          enable-AzPSSession: false
+
+      - name: Verify login failed as expected
+        env:
+          LOGIN_OUTCOME: ${{ steps.login.outcome }}
+        run: |
+          test "$LOGIN_OUTCOME" = failure
+          echo 'Expected failure: confirm GitHub OIDC acquisition failed with ECONNREFUSED 127.0.0.1:9 in the login log.' >> "$GITHUB_STEP_SUMMARY"
