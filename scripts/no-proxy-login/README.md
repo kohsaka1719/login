@@ -10,8 +10,11 @@ Azure resources. The existing `azure-login-live-tests.yml` is unchanged.
   `SP1_CLIENT_ID`, `SP1_TENANT_ID`, and `SP1_SUBSCRIPTION_ID` secrets.
 - SP1 needs federated trust for this fork and Environment, and access to the
   selected subscription. No client secret, SP2, or provisioning credential is used.
-- The workflow must exist on the default branch for manual dispatch. Select the
-  verification branch when running **NO_PROXY: built Azure Login comparison**.
+- The workflow must exist on the default branch for manual dispatch. Run
+  **NO_PROXY: built Azure Login comparison** on `verify-pr-630`, which is allowed
+  by this fork's existing Environment deployment rules. The separate
+  `verify-no-proxy-pr-630` branch contains the same harness but is not allowed by
+  those rules; Environment protection was not relaxed for this experiment.
 
 ## Pinned sources and expectations
 
